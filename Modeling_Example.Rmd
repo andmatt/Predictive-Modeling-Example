@@ -1,0 +1,331 @@
+---
+title: "Model Building Example"
+author: "Matt Guan"
+date: "December 11, 2016"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 100)
+```
+
+#Business Context
+Regression is a powerful tool that is used widely across industries. Businesses typically use regression to gain insights into the key drivers of their KPI of interest (Volume Sales, Revenue, Conversion Rate, Close Rate etc.)  
+
+The purpose of this exercise is to provide a very simple example of a log-log model, and to highlight some of the key steps in the model building process. In addition, we will cover how to translate our model coefficients into a tangible output that can be leveraged by the business.  
+
+#Useful R Packages
+```{r, message=FALSE}
+library(data.table) #use SQL syntax in R
+library(dplyr) #comprehensive data cleaning package
+library(randomForest) #Random Forest ; Frequently used to test variable importance
+library(ggplot2) #better graphics than base
+library(lmtest) #lots of model diagnostic calculations
+```
+
+#Data Import / Cleaning
+The below code imports 2 files - The SuperStore dataset, which is commonly used in Tableau Examples, and a returns mapping file. Data is at a transaction level
+```{r}
+getwd()
+setwd("C:/Users/Matt/Desktop/Modeling Example")
+read.csv("Sales.csv", header=T, na.strings="", stringsAsFactors = T) -> sales
+read.csv("Closed.csv", header=T, na.string="") -> close
+
+merge(sales, close, by="Order.ID", all.x=T)->sales
+sales$close_status <- ifelse(is.na(sales$Status), 0, 1)
+
+```
+
+In addition, there is usually some data cleaning involved in the initial steps. Here I need to convert the date metrics to the proper format
+
+```{r}
+#Generate Date Variables Dates
+sales$order_date<-as.Date(sales$Order.Date, origin="1899-12-30")
+sales$ship_date<-as.Date(sales$Ship.Date, origin="1899-12-30")
+sales$ship_time<-difftime(sales$ship_date, sales$order_date, units="days")
+
+sales$week<-ifelse(sales$Week..<10, paste("0",sales$Week..,sep=""), as.character(sales$Week..))
+sales$month<-ifelse(sales$Month<10, paste("0",sales$Month,sep=""), as.character(sales$Month))
+sales$fiscal_week<- paste(sales$Year,"-",sales$Week.., sep="")
+```
+
+#Quick Data Breakdown
+
+First, I want to take a quick look into the data to see what level I can do my analysis at.
+
+```{r}
+data.frame(table(sales$Product.Name))->x
+x<- x[order(-x$Freq),]
+x[1:5,]
+```
+It looks like that at a product level, the maximum number of records is 24. Based on the small number of records, I would have to aggregate my models up to the sub-category level. This increase in records would come at the expense of an increase in the variance of the data, and most likely a less clear trend. Normal POS data is usually much more robust than this example set.
+
+```{r}
+options(width=100)
+summary(sales$Product.Category)
+data.table(sales)->stage
+stage[,.(Revenue = sum(Sales), mean.price=mean(Unit.Price), sd.price = sd(Unit.Price),
+         mean.vol=mean(Order.Quantity), sd.vol=sd(Order.Quantity), .N),
+     by=Product.Sub.Category]->table1
+table1
+```
+In this analysis, I will be predicting sales for the "Paper" Sub-Category. I decided to choose this sub-category becuase it's Price and Volume variables exhibit low standard deviations with respect to their means. In addition, the revenue for paper is still relatively large. 
+
+```{r}
+#For the sake of simplicity, we are doing a subcategory analysis for paper
+subset(sales, Product.Sub.Category == "Paper")->set
+set<- set[order(set$Year, set$Week..),]
+set$ID<- 1:nrow(set)
+
+#Variables of Interest - Holiday, Order Priority, Order Qty, Discount, Ship Mode, 
+#Shipping Cost / Unit Price, Customer Segment, shipping time
+data.table(set)->set
+set[,.(ID, Year, month, week, Sales, Product.Name, fiscal_week, order_date, 
+       Order.Priority, Order.Quantity, Unit.Price,
+       Discount, Ship.Mode, Shipping.Cost,
+       Customer.Segment, 
+       ship_time, close_status)] ->reg
+```
+
+#Step 1: Data Cleaning
+In 9 out of 10 cases, your data will not be in a proper format for conducting analysis. Most times, there will be a significant amount of data cleaning involved. Some of the typical steps in this process are listed below.  
+
+* Outlier Treatment  
+* Duplicate Value Treatment  
+* Missing Value Treatment  
+* Aggregate data
+* Secondary Variable Generation  
+* Data Mapping from various sources  
+
+In this example, we will be mapping on Holidays from another file, changing the level of data, generating a secondary variable, and performing oulier treatment
+
+```{r}
+#Join Holidays from mapping file
+read.csv("Holiday_Mapping.csv")->holidays
+holidays$week<-ifelse(holidays$week<10, paste("0",holidays$week,sep=""), as.character(holidays$week))
+merge(reg, holidays, all.x=T)->reg
+
+#Aggregate Data up to fiscal-week level
+data.table(reg)->reg
+reg[,.(Unit_Sales=sum(Order.Quantity), Price=mean(Unit.Price), Discount=mean(Discount), Holiday_Flag), by=.(Year,week)]->reg1
+unique(reg1)->reg1
+reg1<- reg1[order(reg1$Year, reg1$week),]
+reg1$fiscal_week<-paste(reg1$Year,"-",reg1$week, sep="")
+
+
+#Generate a "Seasonality Index" Variable to capture the seasonal fluctuation of our dependent variable
+reg1[,overall_mean_sales := mean(Unit_Sales)]->reg1
+reg1[,SI := mean(Unit_Sales)/overall_mean_sales, by=c("week")]->reg1
+
+#Example Plot of the SI variable
+unique(reg1[,c("week", "SI")])->SI
+plot(SI~week, data=SI, pch=19, lty=1)
+lines(SI~week, data=SI, type = "o", col = "blue")
+
+#Outlier Treatment
+unname(quantile(reg1$Price, .99))->x
+unname(quantile(reg1$Unit_Sales, .99))->y
+
+par(mfrow=c(1,2))
+hist(reg1$Price)
+hist(reg1$Unit_Sales)
+
+reg1$outlier_flag<-ifelse(reg1$Price>x, 1,
+                          ifelse(reg1$Unit_Sales>y, 1,
+                          ifelse(reg1$Unit_Sales<10,1, 0)))
+
+subset(reg1, outlier_flag==0)->reg_1
+
+```
+
+#Step 2: Exploratory Data Analysis
+
+Before any modeling can done, there is typically a very thorough exploratory data analysis to explore trends in the data, and data quality. This gives a general idea of what models may be a good fit, and what some potential issues may be. For the sake of brevity, many parts of this portion of the analysis has been greatly simplified
+
+First, we will look again at the distribution of our key continuous variables. Looking at the below graphs, we can now see that the distributions for price, and volume are now much more normal, post-outlier treatment.
+```{r}
+options(width=100)
+
+par(mfrow=c(1,2))
+hist(reg_1$Price)
+hist(reg_1$Unit_Sales)  
+```
+
+Next, we will do a quick univariate analysis on price, which we are assuming to be one of the key drivers of volume sales. In a full analysis, we would perform an independent investigation on each variable, prior to modeling. Here, we are testing to see if price and volume follow a linear, or log-log relationship.  
+
+When you look at these two graphs, you may notice that the r^2 are extremely low, indicating that price itself may not be the best fit. Typically, we would be looking for an r^2, that is a little higher, especially if we are expecting it to be the primary driver of our dependent variable. However, in multiple regression, a low r^2 is not the end of the world, as other variables may have more explanatory power than we expect.  
+
+The log-log model has a slightly better fit than the linear model, so this is the model we will move forward with. Typically in a business context, the log-log model works very well. The reason for the lack of fit in this case is most likely due to the aggregation performed earlier. If this was a real business problem though, we would probably consider a variety of all models, or hold off on the analysis until a more robust data-set at a product level was obtained.
+
+```{r, echo=FALSE}
+par(mfrow=c(1,1))
+fit<-lm(Unit_Sales~Price, data=reg_1)
+fit1<-lm(log(Unit_Sales)~log(Price), data=reg_1)
+
+funceqn<-function(z)
+{
+  rmse <- round(sqrt(mean(resid(z)^2)), 2)
+  coefs <- coef(z)
+  b0 <- round(coefs[1], 2)
+  b1 <- round(coefs[2],2)
+  r2 <- round(summary(z)$r.squared, 2)
+  
+  eqn <- bquote(italic(y) == .(b0) + .(b1)*italic(x) * "," ~~ 
+                  r^2 == .(r2) * "," ~~ RMSE == .(rmse))
+  return(eqn)
+}
+
+funceqn(fit)->eqn
+funceqn(fit1)->eqn1
+
+plot(Unit_Sales~Price, data=reg_1)
+abline(fit)
+text(2, 12, eqn, pos = 4)
+
+plot(log(Unit_Sales)~log(Price), data=reg_1)
+abline(fit1)
+text(1, 3, eqn1, pos = 4)
+```
+
+Lastly, we will do a check for multicollinearity between the potential model coefficients. Ideally, the variables should be independent, so that each beta coefficient can capture the isolated effect of the variable in question.  
+
+Looking at the correlation matrix below, we can see that there is no noticeable correlation between our independent variables.
+
+```{r, warning=FALSE}
+#Correlation Matrix
+data.frame(reg_1)->cm
+cm[,c(3:6,9)]->cm
+library(sjPlot)
+lapply(cm, as.numeric)->cm[]
+sjp.corr(cm)
+```
+
+#Step 3: Model Fitting
+The next step of the process would be to actually fit, and evaluate the potential models. The below function is used to calculate some of the typical metrics that are used for model comparison.  
+
+The metrics listed here are as follows  
+
+* R^2 - to evaluate the fit of the model / how much of the variance is explained by our variables  
+* Adjusted RSQ - to evalulate the fit of the model, normalizing for the # of variables present
+* P Statistic - to evaluate the significance of our variables
+* MSE - a metric that allows us to evalulate the residuals
+* MAPE - average error in our model
+* AIC - a variable that would allow for easy model comparison
+
+```{r}
+mdiagnostics<-function(x){
+diagnostics<-summary(x)
+model<-data.frame(RSQ=diagnostics$r.squared)
+model$fstat<-diagnostics$fstatistic[1]
+model$pstat<-pf(diagnostics$fstatistic[1], diagnostics$fstatistic[2], diagnostics$fstatistic[3], lower.tail=F)
+model$MSE<-mean(diagnostics$residuals^2)
+model$AdjRSQ<-diagnostics$adj.r.squared
+model$AIC<-AIC(x)
+model$MAPE<- lapply((abs(diagnostics$residuals/x$model[1])), mean, na.rm=T)
+#Check for Heteroscedasticity
+model$BPTestBP<-bptest(x)$statistic
+model$BPTestDF<-bptest(x)$parameter
+model$BPTestPValue<-bptest(x)$p.value
+return(model)
+}
+
+```
+
+In this example, we will look at 2 models - a linear and a log-log model. The model formulas are below.
+$$m1: Sales = Price + DiscountFlag + SIndex + HolidayFlag$$
+
+$$m2: log(Sales) = log(Price) + DiscountFlag + SIndex +HolidayFlag$$
+
+```{r}
+#Model Runs
+m1 <- lm(Unit_Sales~Price+Discount+SI+Holiday_Flag, data=reg_1)
+m2 <- lm(log(Unit_Sales)~log(Price)+Discount+log(SI)+Holiday_Flag, data=reg_1)
+```
+
+```{r}
+#model diagnostics for model 1 (linear)
+summary(m1)
+mdiagnostics(m1)
+```
+
+```{r}
+#model diagnostics for model 2 (log-log)
+summary(m2)
+mdiagnostics(m2)
+```
+
+Looking at the summary statistics, it can be noted that the variables are showing much higher levels of significance in the log-log model. The insignificant variables (p>0.05) are holiday, and discount. In addition, the AIC and MAPE are both **greatly** reduced with the log-log model (AIC down from 2231 to 282 ; MAPE down from 50% to 8%)  
+
+Next let's remove the insignificant holiday variable.
+
+```{r}
+#final model : log-log with the holiday variable removed
+m3 <- lm(log(Unit_Sales)~log(Price)+Discount+log(SI), data=reg_1)
+summary(m3)
+mdiagnostics(m3)
+```
+
+In this final model, there are only marginal improvements in the diagnostic variables, but now all of the variables are significant.  
+Note that this process of variable selection can be automated by various forward or backward selection models in R.  
+Now that we have our final model, we can run a the last two validation checks.
+
+First, let's quickly look at some residual plots to ensure that there is no trend in the errors
+
+```{r}
+par(mfrow=c(1,2))
+plot(predict(m3, data=reg_1),resid(m3))
+plot(reg_1$SI,resid(m3))
+plot(reg_1$Price, resid(m3))
+plot(reg_1$Discount, resid(m3))
+```
+
+The residuals look pretty random to me, which is good.  
+
+The last validation check by training the model on 80% of the data, and testing it on the remaining 20%. This would test the predictive power of the model, and check for overfitting.  
+
+```{r, warning=FALSE}
+#Accuracy Chart Generation
+
+#Train / Test
+floor(0.8 * nrow(reg_1))->train_len
+train_len+1->test_start
+reg_1[1:train_len,]->train
+reg_1[test_start:nrow(reg1),]->test
+
+
+#test/train accuracy
+test$prediction<- predict(m3,test)
+test$predicted_volume<- exp(test$prediction)
+test$Accuracy <- 1-abs((test$predicted_volume-test$Unit_Sales)/test$Unit_Sales)
+qplot(test$Accuracy, geom='histogram', fill=I("blue"),alpha=I(.5), col=I("grey"))
+```
+
+A quick examination of this chart seems to suggest a pretty good accuracy distribution for the test data-set (For reference, accuracy is 1-MAPE). Almost 50% of the records have >70% accuracy, which is pretty good for a model with so few variables, and low r^2.
+
+```{r, warning=FALSE}
+#full model accuracy
+reg_1$prediction<- predict(m3,reg_1)
+reg_1$predicted_volume<- exp(reg_1$prediction)
+reg_1$Accuracy <- 1-abs((reg_1$predicted_volume-reg_1$Unit_Sales)/reg_1$Unit_Sales)
+qplot(reg_1$Accuracy, geom='histogram', fill=I("blue"), alpha=I(.5),col=I("grey"), xlim=c(-1,1))
+```
+
+The final check would just be a look at the accuracy distribution of the full model. Once again, we have around 50% of the records with >70% accuracy. Assuming we are confident with these final results, we get turn these model results into business insights.
+
+Just to recap - the final model looks like this
+$$log(Sales) = log(Price)+log(SI)+DiscountFlag$$
+
+
+#Step 4: Model to Actionable Insights
+In order to convert our model coefficients into something that is more useable to the business, we can generate a volume lift metric - a volume difference between a "baseline" (Our predicted volume based on the model, with all other factors held constant) and an "actual" (what actually happened) value.
+
+Below is just one example of how lift can be calculated from a combination of our model coefficients, new data, and pre-defined "baseline" values for each variable. Baseline values can be set based on a combination of statistical analysis and business knowledge.
+
+$$Y = int + B_1*X_1 + B_2*X_2 + B_3*X_3 + int$$
+$$Y(baseline) = int + B_1*X1(baseline) + B2*X2(baseline) + B3*X3(baseline)$$
+
+$$X_1 (Contribution) = [int + B_1*(X_1actual)+B2*(X_2baseline)+B3*(X_3baseline)] - Y(baseline)$$
+
+$$X_1 (Lift) = X_1 (Contribution) - Y(baseline)$$
